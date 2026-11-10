@@ -1,0 +1,625 @@
+---
+title: "Carnegie Learning: Timestamp Validation and APLSE Analysis"
+author: "Emily Huffaker"
+date: "2026-10-27"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  warning: false
+---
+
+## Research question
+
+**Are students' observed affective states associated with differences in learning performance?**
+
+This notebook follows the original *Affect and Performance Analysis* exploration. It (1) validates BROMP–Caliper timing and observation-to-attempt linkage, (2) checks how the matching window changes the linked sample, (3) diagnoses repeated observations of the same attempt, and (4) evaluates a complementary **student-level** outcome using APLSE Quality.
+
+**Important distinctions:** Attempt performance is an attempt-level score and APLSE Quality is a broader, student-level measure. They are **not interchangeable**. Results here are exploratory associations, not causal effects.
+
+## 1. Load data and packages
+
+The loader works with the original `data/` project folder names and with the numbered filenames uploaded to ChatGPT. You can leave your existing project files unchanged.
+
+```{python}
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+import statsmodels.formula.api as smf
+
+
+def find_data_file(*filenames):
+    for filename in filenames:
+        for location in (Path("data") / filename, Path(filename)):
+            if location.exists():
+                return location
+    raise FileNotFoundError(f"None of these data files were found: {filenames}")
+
+bromp = pd.read_excel(find_data_file("Anonymized BROMP.xlsx", "Anonymized BROMP(2).xlsx"))
+caliper = pd.read_excel(find_data_file("caliper-bromp-data-anon-cleaned.xlsx", "caliper-bromp-data-anon-cleaned(2).xlsx"))
+attempt = pd.read_excel(find_data_file("attempt-data-anon.xlsx", "attempt-data-anon(2).xlsx"))
+aplse = pd.read_excel(find_data_file("aplse-data-anon.xlsx", "aplse-data-anon(2).xlsx"))
+
+print({"BROMP": len(bromp), "Caliper": len(caliper), "Attempt": len(attempt), "APLSE": len(aplse)})
+```
+
+## 2. Reconstruct BROMP timestamps in UTC
+
+BROMP's `ntp_time` is a local Eastern time of the observation protocol start; `msoffsetfromstart` is the milliseconds elapsed before the actual observation. Caliper `event-time` is UTC (marked `Z`). Observations occur on **May 2–3, 2024**, during Eastern Daylight Time. Thus the expected difference is four hours. Instead of hardcoding `+4 hours`, use the named timezone to handle daylight saving time properly on future dates.
+
+The BROMP workbook's dictionary describes the timezone as *likely Eastern*; the +4-hour alignment supports this interpretation, but it should still be confirmed with Carnegie Learning when possible.
+
+```{python}
+bromp["protocol_start_local"] = pd.to_datetime(
+    bromp["ntp_time"], format="%m.%d.%Y at %H:%M:%S", errors="coerce"
+)
+bromp["bromp_time_local"] = (
+    bromp["protocol_start_local"]
+    + pd.to_timedelta(pd.to_numeric(bromp["msoffsetfromstart"], errors="coerce"), unit="ms")
+)
+bromp["bromp_time_utc"] = (
+    bromp["bromp_time_local"]
+    .dt.tz_localize("America/New_York", ambiguous="NaT", nonexistent="NaT")
+    .dt.tz_convert("UTC")
+)
+caliper["event_time_utc"] = pd.to_datetime(caliper["event-time"], utc=True, errors="coerce")
+
+print("Valid BROMP timestamps:", bromp["bromp_time_utc"].notna().sum())
+print("Valid Caliper timestamps:", caliper["event_time_utc"].notna().sum())
+print("BROMP UTC range:", bromp["bromp_time_utc"].min(), "to", bromp["bromp_time_utc"].max())
+```
+
+## 3. Link observations to genuine Caliper attempt events
+
+Filter Caliper events on **both** attempt ID and student ID. Using only the attempt ID would normally be sufficient for a unique identifier, but checking both fields guards against accidental cross-student matches. Do not treat placeholder strings such as `NA` as valid attempt IDs.
+
+```{python}
+attempt_pairs = pd.MultiIndex.from_frame(attempt[["USERID_ANON", "ATTEMPTID"]].dropna())
+caliper_pairs = pd.MultiIndex.from_frame(caliper[["student-id-anon", "attempt-id"]])
+caliper_attempts = caliper.loc[caliper_pairs.isin(attempt_pairs)].copy()
+
+# Completed attempts with a valid positive maximum score.
+for field in ("SCORE", "SCOREMAXIMUM"):
+    attempt[field] = pd.to_numeric(attempt[field], errors="coerce")
+attempt_scored = attempt.loc[
+    attempt["COMPLETEDON"].notna()
+    & attempt["SCORE"].notna()
+    & attempt["SCOREMAXIMUM"].gt(0)
+].copy()
+attempt_scored["performance"] = attempt_scored["SCORE"] / attempt_scored["SCOREMAXIMUM"]
+
+bromp_for_match = (
+    bromp.reset_index(names="observation_id")
+    .dropna(subset=["anon_student_id", "bromp_time_utc"])
+    .sort_values("bromp_time_utc")
+)
+caliper_for_match = (
+    caliper_attempts
+    .dropna(subset=["student-id-anon", "event_time_utc"])
+    .sort_values("event_time_utc")
+)
+
+
+def match_observations(minutes):
+    """Nearest event for the same student, no farther than minutes away."""
+    matched = pd.merge_asof(
+        bromp_for_match,
+        caliper_for_match[["student-id-anon", "event_time_utc", "attempt-id", "action", "stream-name"]],
+        left_on="bromp_time_utc",
+        right_on="event_time_utc",
+        left_by="anon_student_id",
+        right_by="student-id-anon",
+        direction="nearest",
+        tolerance=pd.Timedelta(minutes=minutes),
+    )
+    matched["time_difference_seconds"] = (
+        matched["event_time_utc"] - matched["bromp_time_utc"]
+    ).abs().dt.total_seconds()
+    return matched.merge(
+        attempt_scored[["USERID_ANON", "ATTEMPTID", "FRIENDLYNAME", "performance"]],
+        left_on=["anon_student_id", "attempt-id"],
+        right_on=["USERID_ANON", "ATTEMPTID"],
+        how="left",
+        validate="many_to_one",
+    )
+
+linked_1min = match_observations(1)
+analysis_data = linked_1min.loc[linked_1min["performance"].notna()].copy()
+
+print("BROMP observations with timestamps:", len(linked_1min))
+print("Within one minute of a valid Caliper attempt event:", linked_1min["attempt-id"].notna().sum())
+print("With a scored attempt outcome:", len(analysis_data))
+print("Unique students with scored matches:", analysis_data["anon_student_id"].nunique())
+print("Unique scored attempts:", analysis_data[["anon_student_id", "ATTEMPTID"]].drop_duplicates().shape[0])
+```
+
+## 4. Test multiple matching windows
+
+A wider window creates more matches but may link an observed emotion with an event that occurred farther away in time. Compare both the number of observations and the number of **unique attempts**; the latter is especially important for independence.
+
+```{python}
+window_summary = []
+for minutes in (0.5, 1, 2, 5):
+    matched = match_observations(minutes)
+    scored = matched.loc[matched["performance"].notna()]
+    window_summary.append({
+        "window_seconds": round(minutes * 60),
+        "caliper_matches": int(matched["attempt-id"].notna().sum()),
+        "scored_observations": len(scored),
+        "unique_students": scored["anon_student_id"].nunique(),
+        "unique_scored_attempts": scored[["anon_student_id", "ATTEMPTID"]].drop_duplicates().shape[0],
+    })
+window_summary = pd.DataFrame(window_summary)
+print(window_summary.to_string(index=False))
+```
+
+## 5. Check the repeated-observation problem
+
+The outcome is scored **once per attempt**, even when multiple BROMP observations are attached to that attempt. Observations in the same attempt are not independent outcomes. Report both counts and do not perform a naive observation-level significance test.
+
+```{python}
+attempt_groups = analysis_data.groupby(["anon_student_id", "ATTEMPTID"], dropna=False)
+attempt_audit = attempt_groups.agg(
+    n_bromp_observations=("affect", "size"),
+    n_unique_affect_labels=("affect", "nunique"),
+    performance=("performance", "first"),
+)
+attempt_audit["both_bored_concentrating"] = attempt_groups["affect"].apply(
+    lambda states: {"BORED", "CONCENTRATING"}.issubset(set(states.dropna()))
+)
+print("Unique attempts:", len(attempt_audit))
+print("Attempts with multiple affect labels:", (attempt_audit["n_unique_affect_labels"] > 1).sum())
+print("Attempts containing both boredom and concentration:", attempt_audit["both_bored_concentrating"].sum())
+print(attempt_audit["n_bromp_observations"].describe())
+```
+
+## 6. An alternative outcome: student-level APLSE Quality
+
+APLSE Quality is a student-level outcome. To match that unit, aggregate each student's **valid observed affect states** into proportions before joining to APLSE. Count `UDEF1` separately as an observer code for *gaming behavior*, and exclude `skipped` and `?` from the denominator rather than treating them as actual affect states.
+
+A student may be observed many times; the analysis below gives each student **one** row and **one** APLSE outcome. Results may still be affected by observation coverage, class/session differences, and when APLSE was measured.
+
+```{python}
+valid_affect_states = ["CONCENTRATING", "BORED", "CONFUSED", "FRUSTRATED", "DELIGHT"]
+valid_bromp = bromp.loc[bromp["affect"].isin(valid_affect_states)].copy()
+student_counts = pd.crosstab(valid_bromp["anon_student_id"], valid_bromp["affect"])
+for label in valid_affect_states:
+    if label not in student_counts.columns:
+        student_counts[label] = 0
+
+student_affect = student_counts[valid_affect_states].copy()
+student_affect["n_valid_observations"] = student_affect[valid_affect_states].sum(axis=1)
+for label in valid_affect_states:
+    student_affect[f"prop_{label.lower()}"] = (
+        student_affect[label] / student_affect["n_valid_observations"]
+    )
+student_affect = student_affect.reset_index()
+
+aplse["APLSE Quality"] = pd.to_numeric(aplse["APLSE Quality"], errors="coerce")
+student_level = student_affect.merge(
+    aplse[["USERID_ANON", "APLSE Quality", "Completed Workspaces", "Hours Worked"]],
+    left_on="anon_student_id", right_on="USERID_ANON", how="inner", validate="one_to_one"
+).dropna(subset=["APLSE Quality"])
+
+print("Students with both a valid affect observation and APLSE Quality:", len(student_level))
+print("Valid observations per student (median):", student_level["n_valid_observations"].median())
+print("APLSE Quality description:")
+print(student_level["APLSE Quality"].describe())
+```
+
+### Student-level correlations
+
+Run Pearson and Spearman correlations for the three most relevant, common states. A *positive* value means students observed in that state more frequently tended to have higher APLSE Quality; a *negative* value means the opposite. Neither implies causation. These are **exploratory tests**; account for multiple comparisons before making confirmatory claims.
+
+```{python}
+def affect_correlation(df, label):
+    field = f"prop_{label.lower()}"
+    x, y = df[field], df["APLSE Quality"]
+    pearson = stats.pearsonr(x, y)
+    spearman = stats.spearmanr(x, y)
+    return {
+        "affect": label,
+        "students": len(df),
+        "pearson_r": pearson.statistic,
+        "pearson_p": pearson.pvalue,
+        "spearman_rho": spearman.statistic,
+        "spearman_p": spearman.pvalue,
+    }
+
+correlations = pd.DataFrame([
+    affect_correlation(student_level, label)
+    for label in ("CONCENTRATING", "BORED", "CONFUSED")
+])
+print(correlations.round(4).to_string(index=False))
+```
+
+### Sensitivity to amount of observation data per student
+
+A proportion calculated from only one or two observations is very unstable. Recompute each correlation requiring at least 5, 10, and 15 valid BROMP observations. If estimates change substantially, do not consider the association robust.
+
+```{python}
+robustness = []
+for minimum in (1, 5, 10, 15):
+    subset = student_level.loc[student_level["n_valid_observations"] >= minimum]
+    if len(subset) < 5:
+        continue
+    for label in ("CONCENTRATING", "BORED", "CONFUSED"):
+        estimate = affect_correlation(subset, label)
+        robustness.append({"minimum_observations": minimum, **estimate})
+robustness = pd.DataFrame(robustness)
+print(robustness[["minimum_observations", "affect", "students", "pearson_r", "spearman_rho"]].round(3).to_string(index=False))
+```
+
+### Scatterplot (student is one dot)
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+for ax, label in zip(axes, ("CONCENTRATING", "BORED")):
+    col = f"prop_{label.lower()}"
+    ax.scatter(student_level[col], student_level["APLSE Quality"], alpha=0.55, s=24)
+    ax.set(xlabel=f"Proportion {label.lower()} (valid observations)", ylabel="APLSE Quality", xlim=(-0.02, 1.02), ylim=(-0.02, 1.02))
+    ax.set_title(f"{label.title()} and APLSE Quality")
+fig.suptitle("Student-level exploratory relationships")
+plt.tight_layout()
+plt.show()
+```
+
+## 7. What the analysis can and cannot establish
+
+**Validated:** May 2024 Eastern-local observations align with UTC Caliper activity; the one-minute linkage can be reproduced; wider time windows produce more records; repeated observations belong to a much smaller set of scored attempts; and the BROMP–APLSE data can be summarized at the student level.
+
+**Not yet established:** Whether affect predicts a student's later performance, whether within-attempt affect changes precede specific learning outcomes, or whether relationships hold after accounting for classroom/session structure, prior knowledge, exposure, and measurement timing. Do not imply these from exploratory correlations.
+
+**Next methodological decision:** Confirm the precise timing/definition of APLSE Quality and which outcomes occur after the BROMP observations. If temporal ordering is suitable, consider a pre-specified student-level model for APLSE Quality, with classroom grouping and observation counts accounted for. Keep attempt-level analyses distinct and use one row per attempt (or a hierarchical model) rather than a naive row per BROMP observation.
+
+```{python}
+# Export reproducible, anonymized analytic tables into a project results folder.
+# Remove these lines if you do not want local CSV outputs.
+output_dir = Path("results")
+output_dir.mkdir(exist_ok=True)
+window_summary.to_csv(output_dir / "linkage_window_sensitivity.csv", index=False)
+attempt_audit.reset_index().to_csv(output_dir / "attempt_linkage_audit.csv", index=False)
+student_level.to_csv(output_dir / "aplse_student_level_analysis.csv", index=False)
+correlations.to_csv(output_dir / "aplse_affect_correlations.csv", index=False)
+robustness.to_csv(output_dir / "aplse_correlation_robustness.csv", index=False)
+print("Saved analysis summaries to:", output_dir.resolve())
+```
+
+# Scatterplot
+```{python}
+plt.figure(figsize=(8, 5))
+
+plt.scatter(
+    student_level["prop_confused"],
+    student_level["APLSE Quality"],
+    alpha=0.5
+)
+
+plt.xlabel("Proportion of Observations Confused")
+plt.ylabel("APLSE Quality")
+plt.title("Relationship Between Confusion and Learning Quality")
+
+plt.show()
+```
+
+# Identify students with at least one confusion observation
+```{python}
+student_level["observed_confusion"] = (
+    student_level["prop_confused"] > 0
+)
+
+# Compare learning quality between the two groups
+confusion_comparison = (
+    student_level.groupby("observed_confusion")
+    .agg(
+        students=("APLSE Quality", "count"),
+        mean_quality=("APLSE Quality", "mean"),
+        median_quality=("APLSE Quality", "median"),
+        median_observations=("n_valid_observations", "median")
+    )
+    .round(3)
+)
+
+print(confusion_comparison)
+```
+#observation frequency
+```{python}
+# Account for differences in observation frequency
+student_level["log_observations"] = np.log1p(
+    student_level["n_valid_observations"])
+
+# Fit an exploratory regression model
+model = smf.ols(
+    'Q("APLSE Quality") ~ prop_confused + log_observations',
+    data=student_level
+).fit(cov_type="HC3")
+
+print(model.summary())
+```
+
+
+# Test whether results depend on observation count
+```{python}
+for minimum in [5, 10, 15]:
+
+    subset = student_level[
+        student_level["n_valid_observations"] >= minimum
+    ]
+
+    model_check = smf.ols(
+        'Q("APLSE Quality") ~ prop_confused + log_observations',
+        data=subset
+    ).fit(cov_type="HC3")
+
+    print(f"\nMinimum observations: {minimum}")
+    print(f"Students: {len(subset)}")
+    print(
+        "Confusion coefficient:",
+        round(model_check.params["prop_confused"], 4)
+    )
+    print(
+        "p-value:",
+        round(model_check.pvalues["prop_confused"], 4)
+    )
+    print("R-squared:", round(model_check.rsquared, 4))
+    
+print(aplse.columns.tolist())
+```
+
+# Examine when learning attempts were completed
+```{python}
+attempt_dates = pd.to_datetime(
+    attempt["COMPLETEDON"],
+    errors="coerce",
+    utc=True
+)
+
+print("Earliest completed attempt:", attempt_dates.min())
+print("Latest completed attempt:", attempt_dates.max())
+print("Attempts with valid completion dates:", attempt_dates.notna().sum())
+
+```
+
+
+# Summarize each matched attempt
+```{python}
+timing_check = (
+    analysis_data
+    .groupby(["anon_student_id", "ATTEMPTID"], as_index=False)
+    .agg(last_observation=("bromp_time_utc", "max"))
+    .merge(
+        attempt[["USERID_ANON", "ATTEMPTID", "COMPLETEDON"]],
+        left_on=["anon_student_id", "ATTEMPTID"],
+        right_on=["USERID_ANON", "ATTEMPTID"]
+    )
+)
+
+timing_check["completed_utc"] = pd.to_datetime(
+    timing_check["COMPLETEDON"], utc=True
+)
+
+timing_check["hours_to_completion"] = (
+    timing_check["completed_utc"]
+    - timing_check["last_observation"]
+).dt.total_seconds() / 3600
+
+print(
+    timing_check.loc[
+        timing_check["hours_to_completion"] > 1,
+        ["anon_student_id", "hours_to_completion"]
+    ].round(2).to_string(index=False)
+)
+```
+
+```{python}
+# Find the eight delayed attempts
+late_attempts = timing_check[
+    timing_check["hours_to_completion"] > 1
+].copy()
+
+# Find the last Caliper event for each attempt
+last_caliper = (
+    caliper.groupby(
+        ["student-id-anon", "attempt-id"],
+        as_index=False
+    )
+    .agg(last_caliper_event=("event_time_utc", "max"))
+)
+
+# Connect these records
+late_review = late_attempts.merge(
+    last_caliper,
+    left_on=["anon_student_id", "ATTEMPTID"],
+    right_on=["student-id-anon", "attempt-id"],
+    how="left"
+)
+
+# Compare the last Caliper event to completion
+late_review["caliper_to_completion_hours"] = (
+    late_review["completed_utc"]
+    - late_review["last_caliper_event"]
+).dt.total_seconds() / 3600
+
+print(
+    late_review[
+        [
+            "anon_student_id",
+            "hours_to_completion",
+            "caliper_to_completion_hours"
+        ]
+    ].round(2).to_string(index=False)
+)
+```
+```{python}
+# Identify the final recorded event for each attempt
+last_events = (
+    caliper
+    .sort_values("event_time_utc")
+    .drop_duplicates(
+        subset=["student-id-anon", "attempt-id"],
+        keep="last"
+    )
+    [["student-id-anon", "attempt-id", "action"]]
+    .rename(columns={"action": "last_action"})
+)
+
+# Add final event types to our timing review
+event_review = late_review.merge(
+    last_events,
+    on=["student-id-anon", "attempt-id"],
+    how="left"
+)
+
+print(
+    event_review[
+        [
+            "anon_student_id",
+            "hours_to_completion",
+            "caliper_to_completion_hours",
+            "last_action"
+        ]
+    ].round(2).to_string(index=False)
+)
+```
+
+```{python}
+# Keep observations with valid affect labels
+valid_states = [
+    "CONCENTRATING",
+    "BORED",
+    "CONFUSED",
+    "FRUSTRATED",
+    "DELIGHT"
+]
+
+valid_attempt_data = analysis_data[
+    analysis_data["affect"].isin(valid_states)
+].copy()
+
+# Create indicators for affect states
+for state in valid_states:
+    valid_attempt_data[state.lower()] = (
+        valid_attempt_data["affect"] == state
+    ).astype(int)
+
+# Aggregate to ONE row per attempt
+attempt_level = (
+    valid_attempt_data
+    .groupby(["anon_student_id", "ATTEMPTID"], as_index=False)
+    .agg(
+        performance=("performance", "first"),
+        n_observations=("affect", "size"),
+        prop_confused=("confused", "mean"),
+        prop_bored=("bored", "mean"),
+        prop_concentrating=("concentrating", "mean"),
+        prop_frustrated=("frustrated", "mean"),
+        prop_delight=("delight", "mean")
+    )
+)
+
+print("Total attempts:", len(attempt_level))
+print("Unique students:", attempt_level["anon_student_id"].nunique())
+
+print(
+    attempt_level[
+        ["performance", "n_observations",
+         "prop_confused", "prop_bored",
+         "prop_concentrating"]
+    ].describe().round(3)
+)
+```
+
+```{python}
+# How many attempts contain each affect?
+
+print("Attempts with confusion:",
+      (attempt_level["prop_confused"] > 0).sum())
+
+print("Attempts with boredom:",
+      (attempt_level["prop_bored"] > 0).sum())
+
+print("Attempts with concentration:",
+      (attempt_level["prop_concentrating"] > 0).sum())
+
+# How many attempts have enough observations?
+print("\nAttempts with at least 5 observations:",
+      (attempt_level["n_observations"] >= 5).sum())
+
+print("Attempts with at least 10 observations:",
+      (attempt_level["n_observations"] >= 10).sum())
+
+# Compare performance based on observed confusion
+attempt_level["any_confusion"] = (
+    attempt_level["prop_confused"] > 0
+)
+
+print("\nPerformance by observed confusion:")
+print(
+    attempt_level.groupby("any_confusion")
+    .agg(
+        attempts=("performance", "count"),
+        mean_performance=("performance", "mean"),
+        median_observations=("n_observations", "median")
+    )
+    .round(3)
+    .to_string()
+)
+```
+
+```{python}
+from scipy.stats import spearmanr
+
+affect_vars = [
+    "prop_bored",
+    "prop_concentrating",
+    "prop_confused"
+]
+
+for variable in affect_vars:
+    rho, p = spearmanr(
+        attempt_level[variable],
+        attempt_level["performance"]
+    )
+
+    print(f"\n{variable}")
+    print(f"Spearman correlation: {rho:.3f}")
+    print(f"P-value: {p:.4f}")
+```
+```{python}
+
+# Flag the two questionable completion records
+questionable = event_review.loc[
+    (event_review["caliper_to_completion_hours"] > 1)
+    & event_review["last_action"].isin(["Ended", "Paused"]),
+    ["anon_student_id", "ATTEMPTID"]
+].drop_duplicates()
+
+# Remove those attempts for a sensitivity analysis
+clean_attempts = attempt_level.merge(
+    questionable.assign(questionable=True),
+    on=["anon_student_id", "ATTEMPTID"],
+    how="left"
+)
+
+clean_attempts = clean_attempts[
+    clean_attempts["questionable"] != True
+]
+
+print("Original attempts:", len(attempt_level))
+print("After exclusion:", len(clean_attempts))
+
+for variable in [
+    "prop_bored",
+    "prop_concentrating",
+    "prop_confused"
+]:
+    rho, p = spearmanr(
+        clean_attempts[variable],
+        clean_attempts["performance"]
+    )
+    print(f"{variable}: rho={rho:.3f}, p={p:.4f}")
+```
